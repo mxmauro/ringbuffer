@@ -8,7 +8,7 @@ import (
 
 // -----------------------------------------------------------------------------
 
-// RingBuffer is a thread-safe circular buffer.
+// RingBuffer represents a thread-safe circular buffer.
 type RingBuffer struct {
 	mtx      sync.Mutex
 	buf      []byte
@@ -23,6 +23,18 @@ type RingBuffer struct {
 // If the buffer needs to be expanded, it will be expanded to the next
 // power of two greater than the requested size.
 func New(growSize int) *RingBuffer {
+	// Create and initialize the ring buffer.
+	r := &RingBuffer{}
+	r.Initialize(growSize)
+
+	// Done
+	return r
+}
+
+// Initialize initializes a circular buffer with an initial size.
+// If the buffer needs to be expanded, it will be expanded to the next
+// power of two greater than the requested size.
+func (r *RingBuffer) Initialize(growSize int) {
 	if growSize <= 15 {
 		growSize = 16
 	} else if growSize > 1048576 {
@@ -37,12 +49,9 @@ func New(growSize int) *RingBuffer {
 		growSize += 1
 	}
 
-	// Create the ring buffer.
-	return &RingBuffer{
-		mtx:      sync.Mutex{},
-		buf:      make([]byte, growSize),
-		growSize: growSize,
-	}
+	// Initialize the ring buffer.
+	r.buf = make([]byte, growSize)
+	r.growSize = growSize
 }
 
 // Peek reads up to len(p) bytes from the buffer without advancing the read-position.
@@ -110,21 +119,43 @@ func (r *RingBuffer) Write(p []byte) (n int, err error) {
 // Find returns the index of the first occurrence of b in the unread portion of the buffer,
 // or -1 if b is not present in the buffer.
 func (r *RingBuffer) Find(b byte) int {
-	r.mtx.Lock()
-	defer r.mtx.Unlock()
+	foundIdx := -1
+	r.Scan(func(elem byte, idx int) bool {
+		if elem == b {
+			foundIdx = idx
+			return true
+		}
+		return false
+	})
+	return foundIdx
+}
 
-	ofs1, len1, len2 := r.readInfo()
-	for idx := 0; idx < len1; idx++ {
-		if b == r.buf[ofs1+idx] {
-			return idx
-		}
+// FindBytes returns the index of the first occurrence of the slice b in the unread portion of the buffer,
+// or -1 if b is not present in the buffer.
+func (r *RingBuffer) FindBytes(b []byte) int {
+	if len(b) == 0 {
+		return -1
 	}
-	for idx := 0; idx < len2; idx++ {
-		if b == r.buf[idx] {
-			return len1 + idx
+
+	foundIdx := -1
+	currentOfs := 0
+	potentialStartIdx := -1
+	r.Scan(func(elem byte, idx int) bool {
+		if elem == b[currentOfs] {
+			if currentOfs == 0 {
+				potentialStartIdx = idx
+			}
+			currentOfs += 1
+			if currentOfs == len(b) {
+				foundIdx = potentialStartIdx
+				return true
+			}
+		} else {
+			currentOfs = 0
 		}
-	}
-	return -1
+		return false
+	})
+	return foundIdx
 }
 
 // Scan calls fn for each byte in the unread portion of the buffer.
@@ -134,6 +165,7 @@ func (r *RingBuffer) Scan(fn func(elem byte, idx int) bool) {
 	defer r.mtx.Unlock()
 
 	ofs1, len1, len2 := r.readInfo()
+
 	for idx := 0; idx < len1; idx++ {
 		stop := fn(r.buf[ofs1+idx], idx)
 		if stop {
@@ -199,21 +231,20 @@ func (r *RingBuffer) ensureCapacity(n int) error {
 }
 
 func (r *RingBuffer) growBuffer(newSize int) {
-	if newSize <= len(r.buf) {
-		return
-	}
+	if newSize > len(r.buf) {
+		newBuf := make([]byte, newSize)
 
-	newBuf := make([]byte, newSize)
+		if r.readPos+r.written <= len(r.buf) {
+			copy(newBuf, r.buf[r.readPos:r.readPos+r.written])
+		} else {
+			temp := len(r.buf) - r.readPos
+			copy(newBuf, r.buf[r.readPos:])
+			copy(newBuf[temp:], r.buf[:r.written-temp])
+		}
 
-	if r.readPos+r.written <= len(r.buf) {
-		copy(newBuf, r.buf[r.readPos:r.readPos+r.written])
-	} else {
-		temp := len(r.buf) - r.readPos
-		copy(newBuf, r.buf[r.readPos:])
-		copy(newBuf[temp:], r.buf[:r.written-temp])
+		r.buf = newBuf
+		r.readPos = 0
 	}
-	r.buf = newBuf
-	r.readPos = 0
 }
 
 func (r *RingBuffer) advanceReadPos(n int) {
@@ -234,10 +265,13 @@ func (r *RingBuffer) peek(buf []byte) (int, error) {
 	if n == 0 {
 		return 0, nil
 	}
+
 	ofs1, len1, len2 := r.readInfo()
+
 	if len1 == 0 && len2 == 0 {
-		return 0, io.EOF
+		return 0, io.EOF // Nothing to read.
 	}
+
 	if n <= len1 {
 		copy(buf, r.buf[ofs1:ofs1+n])
 	} else {
@@ -247,5 +281,6 @@ func (r *RingBuffer) peek(buf []byte) (int, error) {
 		copy(buf, r.buf[ofs1:])
 		copy(buf[len1:], r.buf[:len2])
 	}
+
 	return n, nil
 }
